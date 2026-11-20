@@ -4,6 +4,7 @@
 #include <maya/MFnUnitAttribute.h>
 #include <maya/MFnMatrixAttribute.h>
 #include <maya/MFnCompoundAttribute.h>
+#include <maya/MFnMesh.h>
 #include <maya/MItGeometry.h>
 #include <maya/MDataBlock.h>
 #include <maya/MDataHandle.h>
@@ -12,6 +13,7 @@
 #include <maya/MTime.h>
 #include <maya/MPlug.h>
 #include <maya/MPlugArray.h>
+#include <maya/MDoubleArray.h>
 
 #include <algorithm>
 #include <cmath>
@@ -26,6 +28,9 @@ MObject JiggleDeformer::aTime;
 MObject JiggleDeformer::aStartFrame;
 MObject JiggleDeformer::aStiffnessMagnitude;
 MObject JiggleDeformer::aDampingMagnitude;
+MObject JiggleDeformer::aMaxInward;
+MObject JiggleDeformer::aFoldCorrection;
+MObject JiggleDeformer::aFoldIterations;
 MObject JiggleDeformer::aPerGeometry;
 MObject JiggleDeformer::aWeight;
 MObject JiggleDeformer::aStiffness;
@@ -88,6 +93,32 @@ MStatus JiggleDeformer::initialize()
     nAttr.setSoftMax(1.0);
     addAttribute(aDampingMagnitude);
     attributeAffects(aDampingMagnitude, outputGeom);
+
+    // How far a vertex may sink into the surface (against its normal),
+    // measured in edge lengths around that vertex:  1.0 = one edge length.
+    // Outward movement is never limited.
+    aMaxInward = nAttr.create("maxInward", "mxin", MFnNumericData::kFloat, 1.0);
+    nAttr.setKeyable(true);
+    nAttr.setMin(0.0);
+    nAttr.setSoftMax(2.0);
+    addAttribute(aMaxInward);
+    attributeAffects(aMaxInward, outputGeom);
+
+    // How strongly a folded (flipped) face is pulled back toward the goal, per iteration.
+    aFoldCorrection = nAttr.create("foldCorrection", "fcor", MFnNumericData::kFloat, 0.5);
+    nAttr.setKeyable(true);
+    nAttr.setMin(0.0);
+    nAttr.setMax(1.0);
+    addAttribute(aFoldCorrection);
+    attributeAffects(aFoldCorrection, outputGeom);
+
+    // How many times per frame the folds are checked and fixed.  0 = off.
+    aFoldIterations = nAttr.create("foldIterations", "fitr", MFnNumericData::kInt, 3);
+    nAttr.setKeyable(true);
+    nAttr.setMin(0);
+    nAttr.setSoftMax(10);
+    addAttribute(aFoldIterations);
+    attributeAffects(aFoldIterations, outputGeom);
 
     // ---- Per geometry: sliders ----
 
@@ -230,6 +261,10 @@ MStatus JiggleDeformer::deform(MDataBlock& data, MItGeometry& itGeo,
     float stiffnessMagnitude = data.inputValue(aStiffnessMagnitude).asFloat();
     float dampingMagnitude   = data.inputValue(aDampingMagnitude).asFloat();
 
+    float maxInward      = data.inputValue(aMaxInward).asFloat();
+    float foldCorrection = data.inputValue(aFoldCorrection).asFloat();
+    int   foldIterations = data.inputValue(aFoldIterations).asInt();
+
 
     // ---- 1. Goal: the incoming shape, in world space ----
     // World space so that moving the transform also makes it jiggle.
@@ -283,6 +318,53 @@ MStatus JiggleDeformer::deform(MDataBlock& data, MItGeometry& itGeo,
                 maxVertexId_[geometryIndex] = itGeo.index();
 
             ++i;
+        }
+
+        // Rebuild the face list.
+        // Only meshes have faces; for other geometry (lattice, curves...) the list stays
+        // empty and the fold sections below simply do nothing.
+        faceVertexCounts_[geometryIndex].clear();
+        faceVertexIndices_[geometryIndex].clear();
+
+        MArrayDataHandle inputHandle = data.outputArrayValue(input);
+        inputHandle.jumpToElement(geometryIndex);
+        MObject inputMesh = inputHandle.outputValue().child(inputGeom).asMesh();
+
+        if (!inputMesh.isNull())
+        {
+            MFnMesh meshFn(inputMesh);
+            MIntArray polygonCounts;
+            MIntArray polygonVertexIds;
+            meshFn.getVertices(polygonCounts, polygonVertexIds);
+
+            // Vertex id -> iteration index  (-1 = not affected by the deformer)
+            MIntArray indexById(maxVertexId_[geometryIndex] + 1, -1);
+            for (unsigned int i = 0; i < vertexCount; ++i)
+                indexById[membership_[geometryIndex][i]] = i;
+
+            unsigned int offset = 0;
+            for (unsigned int f = 0; f < polygonCounts.length(); ++f)
+            {
+                int count = polygonCounts[f];
+
+                // Keep the face only if all its vertices are deformed
+                bool allAffected = true;
+                for (int j = 0; j < count; ++j)
+                {
+                    int vertexId = polygonVertexIds[offset + j];
+                    if (vertexId > maxVertexId_[geometryIndex] || indexById[vertexId] == -1)
+                        allAffected = false;
+                }
+
+                if (allAffected)
+                {
+                    faceVertexCounts_[geometryIndex].append(count);
+                    for (int j = 0; j < count; ++j)
+                        faceVertexIndices_[geometryIndex].append(indexById[polygonVertexIds[offset + j]]);
+                }
+
+                offset += count;
+            }
         }
 
         // Different vertices: the maps must be re-read and the simulation restarted.
@@ -443,11 +525,139 @@ MStatus JiggleDeformer::deform(MDataBlock& data, MItGeometry& itGeo,
         }
     }
 
+
+    // ---- 8. Normals and edge lengths of the goal ----
+    // Face normal = sum of cross products over a fan from the first vertex.
+    // It is not normalized: its length grows with the face area, so big faces
+    // count more when they are added together into the vertex normals.
+
+    unsigned int faceCount = faceVertexCounts_[geometryIndex].length();
+
+    MVectorArray goalFaceNormals(faceCount, MVector::zero);
+    MVectorArray goalVertexNormals(vertexCount, MVector::zero);
+    MDoubleArray edgeLengthSum(vertexCount, 0.0);
+    MIntArray    edgeCount(vertexCount, 0);
+
+    unsigned int offset = 0;
+    for (unsigned int f = 0; f < faceCount; ++f)
+    {
+        int count = faceVertexCounts_[geometryIndex][f];
+        int first = faceVertexIndices_[geometryIndex][offset];
+
+        for (int j = 1; j < count - 1; ++j)
+        {
+            int a = faceVertexIndices_[geometryIndex][offset + j];
+            int b = faceVertexIndices_[geometryIndex][offset + j + 1];
+            goalFaceNormals[f] += (goal[a] - goal[first]) ^ (goal[b] - goal[first]);
+        }
+
+        for (int j = 0; j < count; ++j)
+        {
+            int a = faceVertexIndices_[geometryIndex][offset + j];
+            int b = faceVertexIndices_[geometryIndex][offset + (j + 1) % count];
+
+            goalVertexNormals[a] += goalFaceNormals[f];
+
+            // Edge a-b: add its length to both ends
+            double length = goal[a].distanceTo(goal[b]);
+            edgeLengthSum[a] += length;
+            edgeLengthSum[b] += length;
+            edgeCount[a] += 1;
+            edgeCount[b] += 1;
+        }
+
+        offset += count;
+    }
+
+    for (unsigned int i = 0; i < vertexCount; ++i)
+    {
+        if (goalVertexNormals[i].length() > 0.0)
+            goalVertexNormals[i].normalize();
+    }
+
+
+    // ---- 9. Limit how far a vertex can sink into the surface ----
+    // Split the jiggle offset along the goal normal:
+    //   positive = outward  -> always allowed
+    //   negative = inward   -> at most  maxInward x (average edge length around the vertex)
+    // Vertices without faces have a zero normal and are left alone.
+
+    for (unsigned int i = 0; i < vertexCount; ++i)
+    {
+        if (edgeCount[i] == 0)
+            continue;
+
+        double limit  = maxInward * edgeLengthSum[i] / edgeCount[i];
+        MVector offsetFromGoal = positions_[geometryIndex][i] - goal[i];
+        double inward = offsetFromGoal * goalVertexNormals[i];   // dot product
+
+        if (inward < -limit)
+        {
+            // Push the point back out to the limit
+            positions_[geometryIndex][i] = positions_[geometryIndex][i] + goalVertexNormals[i] * (-limit - inward);
+
+            // Remove the inward part of the velocity, so it does not push in again next frame
+            double inwardSpeed = velocities_[geometryIndex][i] * goalVertexNormals[i];
+            if (inwardSpeed < 0.0)
+                velocities_[geometryIndex][i] = velocities_[geometryIndex][i] - goalVertexNormals[i] * inwardSpeed;
+        }
+    }
+
+
+    // ---- 10. Fix folded faces ----
+    // A face is folded when its simulated normal points against its goal normal
+    // (dot product below 0).  Every vertex of a folded face is pulled toward the
+    // goal and slowed down.  Fixing one face can fold its neighbour, so repeat
+    // a few times, and stop early when nothing is folded anymore.
+
+    for (int iteration = 0; iteration < foldIterations; ++iteration)
+    {
+        MIntArray folded(vertexCount, 0);
+        bool anyFolded = false;
+
+        offset = 0;
+        for (unsigned int f = 0; f < faceCount; ++f)
+        {
+            int count = faceVertexCounts_[geometryIndex][f];
+            int first = faceVertexIndices_[geometryIndex][offset];
+
+            MVector simNormal = MVector::zero;
+            for (int j = 1; j < count - 1; ++j)
+            {
+                int a = faceVertexIndices_[geometryIndex][offset + j];
+                int b = faceVertexIndices_[geometryIndex][offset + j + 1];
+                simNormal += (positions_[geometryIndex][a] - positions_[geometryIndex][first])
+                           ^ (positions_[geometryIndex][b] - positions_[geometryIndex][first]);
+            }
+
+            if (simNormal * goalFaceNormals[f] < 0.0)
+            {
+                anyFolded = true;
+                for (int j = 0; j < count; ++j)
+                    folded[faceVertexIndices_[geometryIndex][offset + j]] = 1;
+            }
+
+            offset += count;
+        }
+
+        if (!anyFolded)
+            break;
+
+        for (unsigned int i = 0; i < vertexCount; ++i)
+        {
+            if (folded[i] == 1)
+            {
+                positions_[geometryIndex][i]  = positions_[geometryIndex][i] + (goal[i] - positions_[geometryIndex][i]) * foldCorrection;
+                velocities_[geometryIndex][i] = velocities_[geometryIndex][i] * (1.0 - foldCorrection);
+            }
+        }
+    }
+
     lastFrame_[geometryIndex] = frame;
     lastGoal_[geometryIndex]  = goal;
 
 
-    // ---- 8. Output: blend from the goal toward the simulation, back to object space ----
+    // ---- 11. Output: blend from the goal toward the simulation, back to object space ----
 
     MMatrix worldToLocal = localToWorld.inverse();
     MPointArray result(vertexCount);

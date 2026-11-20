@@ -29,6 +29,9 @@ public:
     static MObject aStartFrame;
     static MObject aStiffnessMagnitude;
     static MObject aDampingMagnitude;
+    static MObject aMaxInward;
+    static MObject aFoldCorrection;
+    static MObject aFoldIterations;
 
     // ---- Per geometry attributes:  perGeometry[i] matches input[i] ----
     static MObject aPerGeometry;
@@ -56,6 +59,12 @@ private:
     // ---- Vertices affected by the deformer ----
     std::map<unsigned int, MIntArray>    membership_;
     std::map<unsigned int, int>          maxVertexId_;
+
+    // ---- Faces (only faces whose vertices are all affected by the deformer) ----
+    // faceVertexIndices_ holds the faces back to back, as iteration indices (not vertex ids).
+    // faceVertexCounts_[f] tells how many of them belong to face f.
+    std::map<unsigned int, MIntArray>    faceVertexCounts_;
+    std::map<unsigned int, MIntArray>    faceVertexIndices_;
 
     // ---- Painted maps (cached, only re-read when dirty) ----
     std::map<unsigned int, MFloatArray>  weightMap_;      // Maya's built-in weightList
